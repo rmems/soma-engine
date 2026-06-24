@@ -15,8 +15,6 @@ pub struct ServiceConfig {
     /// Whether the service is enabled in this daemon instance.
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// Optional endpoint override for the service.
-    pub endpoint: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -29,7 +27,6 @@ impl ServiceConfig {
         Self {
             name: name.into(),
             enabled: true,
-            endpoint: None,
         }
     }
 }
@@ -105,7 +102,6 @@ mod tests {
             ServiceConfig {
                 name: "mining-adapter".to_string(),
                 enabled: false,
-                endpoint: None,
             },
         ];
         let registry = ServiceRegistry::from_configs(configs);
@@ -130,20 +126,12 @@ mod tests {
         let configs = vec![
             ServiceConfig {
                 name: "telemetry".to_string(),
-                enabled: true,
-                endpoint: Some("tcp://127.0.0.1:7001".to_string()),
+                enabled: false,
             },
-            ServiceConfig {
-                name: "telemetry".to_string(),
-                enabled: true,
-                endpoint: Some("tcp://127.0.0.1:7002".to_string()),
-            },
+            ServiceConfig::named("telemetry"),
         ];
         let registry = ServiceRegistry::from_configs(configs);
         assert_eq!(registry.len(), 1);
-        assert_eq!(
-            registry.get("telemetry").unwrap().endpoint.as_deref(),
-            Some("tcp://127.0.0.1:7002")
-        );
+        assert!(registry.get("telemetry").unwrap().enabled);
     }
 }

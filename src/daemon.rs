@@ -17,6 +17,12 @@ use tracing::{error, info, warn};
 
 use crate::registry::{ServiceConfig, ServiceRegistry};
 
+/// Environment variable name used by `corpus-ipc` to discover the ZMQ readout endpoint.
+///
+/// This is a `corpus-ipc` integration contract; the daemon does not choose the name.
+/// Callers are expected to set this variable before initializing the runtime.
+pub const CORPUS_IPC_READOUT_ENV: &str = "SPIKENAUT_ZMQ_READOUT_IPC";
+
 /// Daemon configuration loaded from TOML.
 #[derive(Debug, Deserialize, Clone)]
 pub struct DaemonConfig {
@@ -70,14 +76,11 @@ impl BrainstemDaemon {
     pub async fn run(self) -> Result<()> {
         let cfg = self.config;
 
-        if cfg.tick_rate_hz == 0 {
-            anyhow::bail!("tick_rate_hz must be > 0");
+        if cfg.tick_rate_hz == 0 || cfg.tick_rate_hz > 1_000_000 {
+            anyhow::bail!("tick_rate_hz must be in range 1..=1_000_000");
         }
 
         let tick_duration = Duration::from_micros(1_000_000 / u64::from(cfg.tick_rate_hz));
-        if tick_duration.is_zero() {
-            anyhow::bail!("tick_rate_hz is too high; tick duration must be at least 1 microsecond");
-        }
         let mut ticker = time::interval(tick_duration);
         ticker.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
 
@@ -85,17 +88,14 @@ impl BrainstemDaemon {
             SpikingNetwork::with_dimensions(cfg.lif_count, cfg.izh_count, cfg.channels);
 
         let mut ingress = ZmqBrainBackend::new();
-        let readout_endpoint = format!("tcp://127.0.0.1:{}", cfg.spine_sub_port);
-        // SAFETY: this daemon is single-threaded during initialization and no other
-        // threads read env vars here.
-        unsafe {
-            std::env::set_var("SPIKENAUT_ZMQ_READOUT_IPC", &readout_endpoint);
-        }
+        // `corpus-ipc` reads `CORPUS_IPC_READOUT_ENV` during initialization; the caller
+        // must set it before entering the async runtime.
         ingress.initialize(Some(&cfg.model_path.to_string_lossy()))?;
 
         let zmq_context = zmq::Context::new();
         let pub_socket = zmq_context.socket(zmq::PUB)?;
         pub_socket.bind(&format!("tcp://*:{}", cfg.spine_pub_port))?;
+        let readout_endpoint = format!("tcp://127.0.0.1:{}", cfg.spine_sub_port);
         info!(
             "Ingress SUB {} / Egress PUB tcp://*:{}",
             readout_endpoint, cfg.spine_pub_port
@@ -160,15 +160,17 @@ fn publish_spikes(pub_socket: &zmq::Socket, spike_ids: &[usize]) -> Result<()> {
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?;
     let tick = now.as_millis() as u64;
 
-    let spikes = spike_ids
+    let spikes: Vec<SpikeEvent> = spike_ids
         .iter()
-        .filter_map(|&idx| u16::try_from(idx).ok())
-        .map(|channel| SpikeEvent {
-            channel,
-            time: (tick & u32::MAX as u64) as u32,
-            strength: 1.0,
+        .map(|&idx| {
+            u16::try_from(idx).map(|channel| SpikeEvent {
+                channel,
+                time: (tick & u32::MAX as u64) as u32,
+                strength: 1.0,
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>, std::num::TryFromIntError>>()
+        .map_err(|e| anyhow::anyhow!("spike id exceeds u16 range: {e}"))?;
 
     let msg = SpineMessage::Spikes(SpikeBatch {
         session_id: None,
@@ -218,7 +220,6 @@ mod tests {
         cfg.services.push(ServiceConfig {
             name: "mining-adapter".to_string(),
             enabled: false,
-            endpoint: None,
         });
         let daemon = BrainstemDaemon::new(cfg);
         assert!(!daemon.registry().contains("mining-adapter"));

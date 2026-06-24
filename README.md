@@ -1,6 +1,6 @@
 # Brainstem Daemon
 
-[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
+[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
 High-performance spiking neural-network runtime written in Rust.
 
@@ -54,7 +54,6 @@ enabled = true
 [[services]]
 name = "critic-ipc"
 enabled = true
-endpoint = "tcp://127.0.0.1:7001"
 ```
 
 ---

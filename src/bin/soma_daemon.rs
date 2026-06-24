@@ -5,7 +5,7 @@
 
 use std::path::PathBuf;
 
-use brainstem_daemon::daemon::{BrainstemDaemon, DaemonConfig};
+use brainstem_daemon::daemon::{BrainstemDaemon, CORPUS_IPC_READOUT_ENV, DaemonConfig};
 use clap::Parser;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -25,19 +25,31 @@ fn default_config_path() -> PathBuf {
         .join("soma/daemon.toml")
 }
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let config_path = cli.config.unwrap_or_else(default_config_path);
 
-    let cfg = match DaemonConfig::load(&config_path) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("Failed to load config {}: {e}", config_path.display());
-            std::process::exit(1);
-        }
-    };
+    let cfg = DaemonConfig::load(&config_path).map_err(|e| {
+        eprintln!("Failed to load config {}: {e}", config_path.display());
+        std::process::exit(1);
+    })?;
 
+    // `corpus-ipc` reads the ZMQ readout endpoint from this env var during
+    // `ZmqBrainBackend::initialize`. Set it on the main thread before any
+    // async runtime / worker threads are spawned.
+    // SAFETY: no other threads exist at this point in `main`.
+    let readout_endpoint = format!("tcp://127.0.0.1:{}", cfg.spine_sub_port);
+    unsafe {
+        std::env::set_var(CORPUS_IPC_READOUT_ENV, &readout_endpoint);
+    }
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(run(cfg, config_path))
+}
+
+async fn run(cfg: DaemonConfig, config_path: PathBuf) -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_new(cfg.log_level.clone()).unwrap_or_else(|_| EnvFilter::new("info")),
