@@ -75,7 +75,11 @@ impl BrainstemDaemon {
         }
 
         let tick_duration = Duration::from_micros(1_000_000 / u64::from(cfg.tick_rate_hz));
+        if tick_duration.is_zero() {
+            anyhow::bail!("tick_rate_hz is too high; tick duration must be at least 1 microsecond");
+        }
         let mut ticker = time::interval(tick_duration);
+        ticker.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
 
         let mut network =
             SpikingNetwork::with_dimensions(cfg.lif_count, cfg.izh_count, cfg.channels);
