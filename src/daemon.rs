@@ -89,50 +89,17 @@ impl BrainstemDaemon {
             anyhow::bail!("tick_rate_hz must be in range 1..=1_000_000");
         }
 
-        let tick_duration = Duration::from_micros(1_000_000 / u64::from(cfg.tick_rate_hz));
+        let tick_duration = Duration::from_nanos(1_000_000_000 / u64::from(cfg.tick_rate_hz));
         let mut ticker = time::interval(tick_duration);
         ticker.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
 
-        let mut network =
-            SpikingNetwork::with_dimensions(cfg.lif_count, cfg.izh_count, cfg.channels);
-
-        let mut ingress = ZmqBrainBackend::new();
-        // `corpus-ipc` reads `CORPUS_IPC_READOUT_ENV` during initialization; the caller
-        // must set it before entering the async runtime.
-        ingress.initialize(Some(&cfg.model_path.to_string_lossy()))?;
-
-        let zmq_context = zmq::Context::new();
-        let pub_socket = zmq_context.socket(zmq::PUB)?;
-        pub_socket.bind(&format!("tcp://*:{}", cfg.spine_pub_port))?;
-        let readout_endpoint = format!("tcp://127.0.0.1:{}", cfg.spine_sub_port);
-        info!(
-            "Ingress SUB {} / Egress PUB tcp://*:{}",
-            readout_endpoint, cfg.spine_pub_port
-        );
+        let (mut network, mut ingress, pub_socket) = init_runtime(&cfg)?;
+        let mut stimuli = vec![0.0; cfg.channels];
 
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
-                    let readout = match ingress.process_signals(&[]) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            warn!("Failed to receive from corpus-ipc backend: {e}");
-                            continue;
-                        }
-                    };
-
-                    let (stimuli, modulators) = decode_inputs(&readout, cfg.channels);
-                    let spike_ids = match network.step(&stimuli, &modulators) {
-                        Ok(spikes) => spikes,
-                        Err(e) => {
-                            error!("Network step failed: {e:?}");
-                            continue;
-                        }
-                    };
-
-                    if let Err(e) = publish_spikes(&pub_socket, &spike_ids) {
-                        warn!("Failed to publish spikes: {e}");
-                    }
+                    run_tick(&mut ingress, &mut network, &pub_socket, &mut stimuli, cfg.channels);
                 }
                 _ = signal::ctrl_c() => {
                     info!("Termination signal received, shutting down");
@@ -145,12 +112,60 @@ impl BrainstemDaemon {
     }
 }
 
-fn decode_inputs(readout: &[f32], channels: usize) -> (Vec<f32>, NeuroModulators) {
-    let mut stimuli = vec![0.0; channels];
+fn init_runtime(cfg: &DaemonConfig) -> Result<(SpikingNetwork, ZmqBrainBackend, zmq::Socket)> {
+    let network = SpikingNetwork::with_dimensions(cfg.lif_count, cfg.izh_count, cfg.channels);
+    let mut ingress = ZmqBrainBackend::new();
+    // `corpus-ipc` reads `CORPUS_IPC_READOUT_ENV` during initialization; the caller
+    // must set it before entering the async runtime.
+    ingress.initialize(Some(&cfg.model_path.to_string_lossy()))?;
+
+    let zmq_context = zmq::Context::new();
+    let pub_socket = zmq_context.socket(zmq::PUB)?;
+    pub_socket.bind(&format!("tcp://*:{}", cfg.spine_pub_port))?;
+    let readout_endpoint = format!("tcp://127.0.0.1:{}", cfg.spine_sub_port);
+    info!(
+        "Ingress SUB {} / Egress PUB tcp://*:{}",
+        readout_endpoint, cfg.spine_pub_port
+    );
+
+    Ok((network, ingress, pub_socket))
+}
+
+fn run_tick(
+    ingress: &mut ZmqBrainBackend,
+    network: &mut SpikingNetwork,
+    pub_socket: &zmq::Socket,
+    stimuli: &mut [f32],
+    channels: usize,
+) {
+    let readout = match ingress.process_signals(&[]) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("Failed to receive from corpus-ipc backend: {e}");
+            return;
+        }
+    };
+
+    let modulators = decode_inputs(&readout, channels, stimuli);
+    let spike_ids = match network.step(stimuli, &modulators) {
+        Ok(spikes) => spikes,
+        Err(e) => {
+            error!("Network step failed: {e:?}");
+            return;
+        }
+    };
+
+    if let Err(e) = publish_spikes(pub_socket, &spike_ids) {
+        warn!("Failed to publish spikes: {e}");
+    }
+}
+
+fn decode_inputs(readout: &[f32], channels: usize, stimuli: &mut [f32]) -> NeuroModulators {
     let upto = readout.len().min(channels);
     stimuli[..upto].copy_from_slice(&readout[..upto]);
+    stimuli[upto..].fill(0.0);
 
-    let modulators = if readout.len() >= channels + 4 {
+    if readout.len() >= channels + 4 {
         NeuroModulators {
             dopamine: readout[channels],
             cortisol: readout[channels + 1],
@@ -160,9 +175,7 @@ fn decode_inputs(readout: &[f32], channels: usize) -> (Vec<f32>, NeuroModulators
         }
     } else {
         NeuroModulators::default()
-    };
-
-    (stimuli, modulators)
+    }
 }
 
 fn publish_spikes(pub_socket: &zmq::Socket, spike_ids: &[usize]) -> Result<()> {
@@ -237,7 +250,8 @@ mod tests {
     #[test]
     fn decode_inputs_fills_stimuli() {
         let readout = vec![0.1, 0.2, 0.3, 0.4];
-        let (stimuli, _mods) = decode_inputs(&readout, 4);
+        let mut stimuli = vec![0.0; 4];
+        let _mods = decode_inputs(&readout, 4, &mut stimuli);
         assert_eq!(stimuli, vec![0.1, 0.2, 0.3, 0.4]);
     }
 
@@ -247,7 +261,8 @@ mod tests {
             .into_iter()
             .chain([0.5, 0.6, 0.7, 0.8])
             .collect::<Vec<_>>();
-        let (_stimuli, mods) = decode_inputs(&readout, 4);
+        let mut stimuli = vec![0.0; 4];
+        let mods = decode_inputs(&readout, 4, &mut stimuli);
         assert_eq!(mods.dopamine, 0.5);
         assert_eq!(mods.cortisol, 0.6);
         assert_eq!(mods.acetylcholine, 0.7);
@@ -257,7 +272,8 @@ mod tests {
     #[test]
     fn decode_inputs_defaults_modulators_when_short() {
         let readout = vec![0.1, 0.2];
-        let (stimuli, mods) = decode_inputs(&readout, 4);
+        let mut stimuli = vec![0.0; 4];
+        let mods = decode_inputs(&readout, 4, &mut stimuli);
         assert_eq!(stimuli, vec![0.1, 0.2, 0.0, 0.0]);
         assert_eq!(mods, NeuroModulators::default());
     }
