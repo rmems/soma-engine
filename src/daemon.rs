@@ -150,7 +150,7 @@ fn run_tick(
     pub_socket: &zmq::Socket,
     stimuli: &mut [f32],
     channels: usize,
-    _spike_buf: &mut Vec<SpikeEvent>,
+    spike_buf: &mut Vec<SpikeEvent>,
 ) {
     // ZMQ calls are synchronous. This is a dedicated current_thread real-time
     // loop (no other tasks). Blocking here is by design for lowest jitter at 1 kHz.
@@ -171,7 +171,7 @@ fn run_tick(
         }
     };
 
-    if let Err(e) = publish_spikes(pub_socket, &spike_ids, _spike_buf) {
+    if let Err(e) = publish_spikes(pub_socket, &spike_ids, spike_buf) {
         warn!("Failed to publish spikes: {e}");
     }
 }
@@ -213,16 +213,19 @@ fn publish_spikes(
         });
     }
 
+    // Hand the current buffer to the message while leaving `out` with matching capacity.
+    // This preserves the pre-allocation across ticks (avoids repeated heap growth at 1 kHz).
+    let spikes = std::mem::replace(out, Vec::with_capacity(out.capacity()));
     let msg = SpineMessage::Spikes(SpikeBatch {
         session_id: None,
         batch_id: tick,
         timestamp: now.as_nanos() as u64,
-        spikes: std::mem::take(out),
+        spikes,
         metadata: None,
     });
     let payload = serde_json::to_vec(&msg)?;
     pub_socket.send(payload, 0)?;
-    // out is now empty; next tick will reuse capacity
+    // `out` is now empty but retains the pre-allocated capacity for the next tick.
     Ok(())
 }
 
