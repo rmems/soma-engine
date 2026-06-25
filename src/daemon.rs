@@ -41,12 +41,15 @@ pub struct DaemonConfig {
 impl DaemonConfig {
     /// Load daemon configuration from a TOML file.
     pub fn load(path: &std::path::Path) -> Result<Self> {
-        if path
-            .components()
-            .any(|c| c == std::path::Component::ParentDir)
+        // Allow relative parent paths (e.g. ../config/daemon.toml from a subdir)
+        // but reject absolute paths that traverse (security hardening).
+        if path.is_absolute()
+            && path
+                .components()
+                .any(|c| c == std::path::Component::ParentDir)
         {
             anyhow::bail!(
-                "config path contains parent-dir components: {}",
+                "absolute config path contains parent-dir components: {}",
                 path.display()
             );
         }
@@ -71,8 +74,15 @@ pub struct BrainstemDaemon {
 impl BrainstemDaemon {
     /// Build a daemon from configuration. The service registry is populated
     /// from the config's `services` list; disabled services are ignored.
+    ///
+    /// # Environment setup for corpus-ipc
+    ///
+    /// Callers must ensure `CORPUS_IPC_READOUT_ENV` (SPIKENAUT_ZMQ_READOUT_IPC)
+    /// is set to the desired ZMQ SUB endpoint *before* calling this constructor
+    /// or `run()`. The binary wrapper sets it on the main thread before any
+    /// runtime is created. Library users are responsible for the same.
     pub fn new(config: DaemonConfig) -> Self {
-        let registry = ServiceRegistry::from_configs(config.services.clone());
+        let registry = ServiceRegistry::from_configs(config.services);
         Self { config, registry }
     }
 
@@ -115,8 +125,8 @@ impl BrainstemDaemon {
 fn init_runtime(cfg: &DaemonConfig) -> Result<(SpikingNetwork, ZmqBrainBackend, zmq::Socket)> {
     let network = SpikingNetwork::with_dimensions(cfg.lif_count, cfg.izh_count, cfg.channels);
     let mut ingress = ZmqBrainBackend::new();
-    // `corpus-ipc` reads `CORPUS_IPC_READOUT_ENV` during initialization; the caller
-    // must set it before entering the async runtime.
+    // `CORPUS_IPC_READOUT_ENV` is set in BrainstemDaemon::new() (or the binary wrapper)
+    // before this point so that corpus-ipc discovers the correct SUB endpoint.
     ingress.initialize(Some(&cfg.model_path.to_string_lossy()))?;
 
     let zmq_context = zmq::Context::new();
