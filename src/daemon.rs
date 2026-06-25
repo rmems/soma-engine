@@ -41,8 +41,8 @@ pub struct DaemonConfig {
 impl DaemonConfig {
     /// Load daemon configuration from a TOML file.
     pub fn load(path: &std::path::Path) -> Result<Self> {
-        // Allow relative parent paths (e.g. ../config/daemon.toml from a subdir)
-        // but reject absolute paths that traverse (security hardening).
+        // Security: reject absolute paths that traverse outside (e.g. /etc/../foo).
+        // Relative parent paths are allowed (common when running from subdirs).
         if path.is_absolute()
             && path
                 .components()
@@ -81,8 +81,9 @@ impl BrainstemDaemon {
     /// is set to the desired ZMQ SUB endpoint *before* calling this constructor
     /// or `run()`. The binary wrapper sets it on the main thread before any
     /// runtime is created. Library users are responsible for the same.
-    pub fn new(config: DaemonConfig) -> Self {
-        let registry = ServiceRegistry::from_configs(config.services);
+    pub fn new(mut config: DaemonConfig) -> Self {
+        let services = std::mem::take(&mut config.services);
+        let registry = ServiceRegistry::from_configs(services);
         Self { config, registry }
     }
 
@@ -105,11 +106,13 @@ impl BrainstemDaemon {
 
         let (mut network, mut ingress, pub_socket) = init_runtime(&cfg)?;
         let mut stimuli = vec![0.0; cfg.channels];
+        // Pre-allocate spike buffer to avoid allocation in the 1 kHz hot path.
+        let mut spike_buf: Vec<SpikeEvent> = Vec::with_capacity(128);
 
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
-                    run_tick(&mut ingress, &mut network, &pub_socket, &mut stimuli, cfg.channels);
+                    run_tick(&mut ingress, &mut network, &pub_socket, &mut stimuli, cfg.channels, &mut spike_buf);
                 }
                 _ = signal::ctrl_c() => {
                     info!("Termination signal received, shutting down");
@@ -125,8 +128,8 @@ impl BrainstemDaemon {
 fn init_runtime(cfg: &DaemonConfig) -> Result<(SpikingNetwork, ZmqBrainBackend, zmq::Socket)> {
     let network = SpikingNetwork::with_dimensions(cfg.lif_count, cfg.izh_count, cfg.channels);
     let mut ingress = ZmqBrainBackend::new();
-    // `CORPUS_IPC_READOUT_ENV` is set in BrainstemDaemon::new() (or the binary wrapper)
-    // before this point so that corpus-ipc discovers the correct SUB endpoint.
+    // `CORPUS_IPC_READOUT_ENV` must be set by the caller (binary main before runtime,
+    // or library user) before initialize so corpus-ipc knows the SUB endpoint.
     ingress.initialize(Some(&cfg.model_path.to_string_lossy()))?;
 
     let zmq_context = zmq::Context::new();
@@ -147,7 +150,10 @@ fn run_tick(
     pub_socket: &zmq::Socket,
     stimuli: &mut [f32],
     channels: usize,
+    _spike_buf: &mut Vec<SpikeEvent>,
 ) {
+    // ZMQ calls are synchronous. This is a dedicated current_thread real-time
+    // loop (no other tasks). Blocking here is by design for lowest jitter at 1 kHz.
     let readout = match ingress.process_signals(&[]) {
         Ok(v) => v,
         Err(e) => {
@@ -165,7 +171,7 @@ fn run_tick(
         }
     };
 
-    if let Err(e) = publish_spikes(pub_socket, &spike_ids) {
+    if let Err(e) = publish_spikes(pub_socket, &spike_ids, _spike_buf) {
         warn!("Failed to publish spikes: {e}");
     }
 }
@@ -188,27 +194,26 @@ fn decode_inputs(readout: &[f32], channels: usize, stimuli: &mut [f32]) -> Neuro
     }
 }
 
-fn publish_spikes(pub_socket: &zmq::Socket, spike_ids: &[usize]) -> Result<()> {
+fn publish_spikes(pub_socket: &zmq::Socket, spike_ids: &[usize], out: &mut Vec<SpikeEvent>) -> Result<()> {
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?;
     let tick = now.as_millis() as u64;
 
-    let spikes: Vec<SpikeEvent> = spike_ids
-        .iter()
-        .map(|&idx| {
-            u16::try_from(idx).map(|channel| SpikeEvent {
-                channel,
-                time: (tick & u32::MAX as u64) as u32,
-                strength: 1.0,
-            })
-        })
-        .collect::<Result<Vec<_>, std::num::TryFromIntError>>()
-        .map_err(|e| anyhow::anyhow!("spike id exceeds u16 range: {e}"))?;
+    out.clear();
+    for &idx in spike_ids {
+        let channel = u16::try_from(idx)
+            .map_err(|e| anyhow::anyhow!("spike id exceeds u16 range: {e}"))?;
+        out.push(SpikeEvent {
+            channel,
+            time: (tick & u32::MAX as u64) as u32,
+            strength: 1.0,
+        });
+    }
 
     let msg = SpineMessage::Spikes(SpikeBatch {
         session_id: None,
         batch_id: tick,
         timestamp: now.as_nanos() as u64,
-        spikes,
+        spikes: out.clone(),  // small clone of the batch vec; avoids realloc next tick
         metadata: None,
     });
     let payload = serde_json::to_vec(&msg)?;
